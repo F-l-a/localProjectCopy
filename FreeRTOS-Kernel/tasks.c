@@ -26,10 +26,6 @@
  *
  */
 
-/* Standard includes. */
-#include <stdlib.h>
-#include <string.h>
-
 /* Defining MPU_WRAPPERS_INCLUDED_FROM_API_FILE prevents task.h from redefining
  * all the API functions to use the MPU wrappers.  That should only be done when
  * task.h is included from an application file. */
@@ -40,6 +36,19 @@
 #include "task.h"
 #include "timers.h"
 #include "stack_macros.h"
+
+/* --- KERNEL-LEVEL SCHEDULER INTEGRATION --- */
+#include <stdlib.h>
+#include <string.h> 
+#include "precise_scheduler.h"
+
+extern volatile uint32_t ulGlobalTimeMs; 
+extern TimelineTaskConfig_t *pxSystemTasks;
+extern uint8_t ucTaskCount;
+extern EventLogRecord_t xEventBuffer[MAX_LOG_EVENTS];
+extern volatile uint16_t usEventIndex;
+extern volatile uint8_t ucTestFinished;
+extern volatile uint32_t ulKernelCycleCount;
 
 /* The default definitions are only available for non-MPU ports. The
  * reason is that the stack alignment requirements vary for different
@@ -4675,7 +4684,7 @@ BaseType_t xTaskIncrementTick( void )
 
     #if ( configUSE_PREEMPTION == 1 ) && ( configNUMBER_OF_CORES > 1 )
     BaseType_t xYieldRequiredForCore[ configNUMBER_OF_CORES ] = { pdFALSE };
-    #endif /* #if ( configUSE_PREEMPTION == 1 ) && ( configNUMBER_OF_CORES > 1 ) */
+    #endif
 
     traceENTER_xTaskIncrementTick();
 
@@ -4697,7 +4706,150 @@ BaseType_t xTaskIncrementTick( void )
         /* Increment the RTOS tick, switching the delayed and overflowed
          * delayed lists if it wraps to 0. */
         xTickCount = xConstTickCount;
+        /* =========================================================================
+        [START: KERNEL-LEVEL SCHEDULER INTEGRATION]
+         The following logic implements a Time-Triggered cyclic executive 
+         directly within the kernel's tick increment routine. It directly manipulates 
+         internal kernel lists to ensure zero-overhead, ISR-safe execution.
+         * ========================================================================= */
+    
+        /* 1. Global Clock Update: Increment the timeline and wrap around at Major Frame boundary */
+        ulGlobalTimeMs = ( ulGlobalTimeMs + 1 ) % MAJOR_FRAME_PERIOD_MS;
 
+        /* 2. Cycle Management and Test Termination */
+        if( ulGlobalTimeMs == 0 ) {
+            ulKernelCycleCount++;
+            
+            /* Check if the required number of cycles (3 full cycles) has been completed */
+            if( ulKernelCycleCount >= 4 ) {
+                
+                /* Test finished: Wake up the Monitor task to print results and halt */
+                if( xMonitorHandle != NULL ) 
+                {
+                    TCB_t *pxMonitorTCB = ( TCB_t * ) xMonitorHandle;
+
+                    /* Extract the Monitor task from the suspended list and put it directly into the Ready list */
+                    if( listIS_CONTAINED_WITHIN( &xSuspendedTaskList, &( pxMonitorTCB->xStateListItem ) ) != pdFALSE )
+                    {
+                        ( void ) uxListRemove( &( pxMonitorTCB->xStateListItem ) );
+                        
+                        /* We add it directly into the Ready List */
+                        prvAddTaskToReadyList( pxMonitorTCB );
+                    }
+                }
+
+                ucTestFinished = 1; 
+                xSwitchRequired = pdTRUE; /* Signals the system to change task (switching to the monitor) */
+                
+                return xSwitchRequired; /* Force a context switch to the Monitor task and exit the tick interrupt immediately */
+            }
+        }
+
+        /* 3. Timeline Enforcement (Kernel-Level Scheduler) */
+        if( pxSystemTasks != NULL )
+        {
+            /* Flag to ensure we only wake up the first SRT task at the beginning of the frame */
+            uint8_t ucSrtWoken = 0;
+
+            for( uint8_t i = 0; i < ucTaskCount; i++ )
+            {
+                /* A. HRT RELEASE: Wake up the task if the current time matches its start time. 
+                 We bypass standard APIs to manipulate lists directly for zero overhead. */
+                if( ( pxSystemTasks[i].type == TASK_TYPE_HRT ) && 
+                    ( ulGlobalTimeMs == pxSystemTasks[i].ulStart_time ) )
+                {
+                    TCB_t *pxTCB = ( TCB_t * ) pxSystemTasks[i].taskHandle;
+
+                    if( listIS_CONTAINED_WITHIN( &xSuspendedTaskList, &( pxTCB->xStateListItem ) ) != pdFALSE )
+                    {
+                        ( void ) uxListRemove( &( pxTCB->xStateListItem ) );
+                        prvAddTaskToReadyList( pxTCB );
+
+                        if( pxTCB->uxPriority >= pxCurrentTCB->uxPriority ) {
+                            xSwitchRequired = pdTRUE;
+                        }
+                    }
+                    
+                    /* Fast logging in RAM */
+                    if( usEventIndex < MAX_LOG_EVENTS ) {
+                        xEventBuffer[usEventIndex].timestamp = ulGlobalTimeMs;
+                        xEventBuffer[usEventIndex].task_name = pxSystemTasks[i].task_name;
+                        xEventBuffer[usEventIndex].event_type = EVENT_KERNEL_RELEASE; 
+                        usEventIndex++;
+                    }
+                }
+
+                /* B. HRT DEADLINE CHECK: If the current time matches the end time and the task 
+                 is still running (not suspended), it missed the deadline and must be terminated. */
+                if( ( pxSystemTasks[i].type == TASK_TYPE_HRT ) && 
+                    ( ulGlobalTimeMs == pxSystemTasks[i].ulEnd_time ) )
+                {
+                    TCB_t *pxTCB = ( TCB_t * ) pxSystemTasks[i].taskHandle;
+
+                    if( listIS_CONTAINED_WITHIN( &xSuspendedTaskList, &( pxTCB->xStateListItem ) ) == pdFALSE )
+                    {
+                        if( usEventIndex < MAX_LOG_EVENTS ) {
+                            xEventBuffer[usEventIndex].timestamp = ulGlobalTimeMs;
+                            xEventBuffer[usEventIndex].task_name = pxSystemTasks[i].task_name;
+                            xEventBuffer[usEventIndex].event_type = EVENT_DEADLINE_MISS;
+                            usEventIndex++;
+                        }
+                        
+                        /* Remove the task from the Ready/Event lists and force it back into the Suspended list */
+                        if( uxListRemove( &( pxTCB->xStateListItem ) ) == ( UBaseType_t ) 0 )
+                        {
+                            taskRESET_READY_PRIORITY( pxTCB->uxPriority );
+                        }
+
+                        if( listLIST_ITEM_CONTAINER( &( pxTCB->xEventListItem ) ) != NULL )
+                        {
+                            ( void ) uxListRemove( &( pxTCB->xEventListItem ) );
+                        }
+
+                        vListInsertEnd( &xSuspendedTaskList, &( pxTCB->xStateListItem ) );
+
+                        /* If the missed task is currently running, force an immediate context switch */
+                        if( pxTCB == pxCurrentTCB )
+                        {
+                            xSwitchRequired = pdTRUE;
+                        }
+                    }
+                }
+
+                /* C. SRT RELEASE: Wake up ONLY the first SRT task at time 0. */
+                if( ( ulGlobalTimeMs == 0 ) && ( pxSystemTasks[i].type == TASK_TYPE_SRT ) )
+                {
+                    if( ucSrtWoken == 0 ) /* Check if we haven't woken up an SRT task yet in this frame */
+                    {
+                        TCB_t *pxTCB = ( TCB_t * ) pxSystemTasks[i].taskHandle;
+
+                        if( listIS_CONTAINED_WITHIN( &xSuspendedTaskList, &( pxTCB->xStateListItem ) ) != pdFALSE )
+                        {
+                            ( void ) uxListRemove( &( pxTCB->xStateListItem ) );
+                            prvAddTaskToReadyList( pxTCB );
+
+                            if( pxTCB->uxPriority >= pxCurrentTCB->uxPriority ) {
+                                xSwitchRequired = pdTRUE;
+                            }
+                        }
+                        
+                        if( usEventIndex < MAX_LOG_EVENTS ) {
+                            xEventBuffer[usEventIndex].timestamp = ulGlobalTimeMs;
+                            xEventBuffer[usEventIndex].task_name = pxSystemTasks[i].task_name;
+                            xEventBuffer[usEventIndex].event_type = EVENT_KERNEL_RELEASE; 
+                            usEventIndex++;
+                        }
+                        
+                        ucSrtWoken = 1; /* Set the flag so we don't wake up the remaining SRT tasks */
+                    }
+                }
+            }
+        } 
+        /* =========================================================================
+         * [END: KERNEL-LEVEL SCHEDULER INTEGRATION]
+         * ========================================================================= */
+
+        
         if( xConstTickCount == ( TickType_t ) 0U )
         {
             taskSWITCH_DELAYED_LISTS();
